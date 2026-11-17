@@ -1,121 +1,101 @@
 import os
-import os
 import telebot
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+from telebot import types
 import yt_dlp
 
-TOKEN = os.environ.get('BOT_TOKEN')
+# ضع توكن بوتك هنا
+TOKEN = "9183863222:AAE4v7z2s4bNuhMVH1-o48vUqV89C2rDmWA"
 bot = telebot.TeleBot(TOKEN)
 
+# مجلد حفظ التحميلات المؤقتة
+DOWNLOAD_DIR = "downloads"
+if not os.path.exists(DOWNLOAD_DIR):
+    os.makedirs(DOWNLOAD_DIR)
+
+# تخزين مؤقت للروابط المرسلة من المستخدمين
 user_links = {}
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
-    bot.reply_to(
-        message,
-        "أهلاً بك يا بطل في بوت قناتك الخارق! 🎬🔥\n\n"
-        "• أرسل لي **رابط فيديو مفرد** لاختيار الدقة وتحميله.\n"
+    welcome_text = (
+        "أهلاً بك يا بطل في بوت قناتك الخارق! 🔥🎬\n\n"
+        "• أرسل لي **رابط فيديو مفرد** لاختيار الدقة وتحميله من أي منصة (يوتيوب، شاهد، وغيرها).\n"
         "• أو أرسل لي **رابط قائمة تشغيل (Playlist)** لسحب وتحميل الحلقات دفعة واحدة!\n\n"
         "جميع الدقات مدعومة (من 4K وحتى 144p)."
     )
+    bot.reply_to(message, welcome_text)
 
-@bot.message_handler(func=lambda message: 'youtube.com' in message.text or 'youtu.be' in message.text)
-def handle_youtube_link(message):
+@bot.message_handler(func=lambda message: message.text and message.text.startswith("http"))
+def handle_url(message):
+    url = message.text.strip()
     user_id = message.from_user.id
-    user_links[user_id] = message.text
+    user_links[user_id] = url
 
-    if 'playlist' in message.text or 'list=' in message.text:
-        markup = InlineKeyboardMarkup()
-        markup.add(
-            InlineKeyboardButton("📥 تحميل قائمة التشغيل كاملة (720p)", callback_data="pl_720"),
-            InlineKeyboardButton("📥 تحميل قائمة التشغيل كاملة (480p)", callback_data="pl_480")
-        )
-        bot.reply_to(message, "📂 يبدو أن هذا رابط **قائمة تشغيل (Playlist)**! اختر الجودة المناسبة لتحميل الحلقات:", reply_markup=markup)
-    else:
-        markup = InlineKeyboardMarkup()
-        markup.row_width = 3
-        markup.add(
-            InlineKeyboardButton("4K", callback_data="res_2160"),
-            InlineKeyboardButton("2K", callback_data="res_1440"),
-            InlineKeyboardButton("1080p", callback_data="res_1080"),
-            InlineKeyboardButton("720p", callback_data="res_720"),
-            InlineKeyboardButton("640p", callback_data="res_640"),
-            InlineKeyboardButton("576p", callback_data="res_576"),
-            InlineKeyboardButton("468p", callback_data="res_468"),
-            InlineKeyboardButton("360p", callback_data="res_360"),
-            InlineKeyboardButton("288p", callback_data="res_288"),
-            InlineKeyboardButton("244p", callback_data="res_244"),
-            InlineKeyboardButton("144p", callback_data="res_144")
-        )
-        bot.reply_to(message, "🎬 اختر دقة التحميل المطلوبة للحلقة:", reply_markup=markup)
+    # إنشاء أزرار اختيار الدقات
+    markup = types.InlineKeyboardMarkup(row_width=3)
+    resolutions = ["4K", "2K", "1080p", "720p", "640p", "576p", "468p", "360p", "288p", "244p", "144p"]
+    
+    buttons = [types.InlineKeyboardButton(res, callback_data=f"dl_{res}") for res in resolutions]
+    markup.add(*buttons)
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith(('res_', 'pl_')))
-def callback_query(call):
+    bot.reply_to(message, "🎬 <b>اختر دقة التحميل المطلوبة للحلقة:</b>", parse_mode="HTML", reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("dl_"))
+def download_video(call):
     user_id = call.from_user.id
     if user_id not in user_links:
         bot.answer_callback_query(call.id, "انتهت صلاحية الرابط، أرسل الرابط من جديد.")
         return
 
     url = user_links[user_id]
-    action_type, resolution = call.data.split('_')
+    resolution = call.data.split("_")[1]
 
-    if action_type == 'res':
-        bot.answer_callback_query(call.id, f"جاري تحميل دقة {resolution}...")
-        msg = bot.send_message(call.message.chat.id, f"⏳ جاري تجهيز الفيديو بجودة {resolution}p، يرجى الانتظار...")
+    bot.answer_callback_query(call.id, f"جاري بدء التحميل بدقة {resolution}...")
+    msg = bot.send_message(call.message.chat.id, f"⏳ <b>جاري سحب ومعالجة الفيديو (دقة {resolution})... يرجى الانتظار</b>", parse_mode="HTML")
 
-        output_template = f"video_{user_id}.mp4"
-        ydl_opts = {
-            'format': f'bestvideo[height<={resolution}]+bestaudio/best[height<={resolution}]/best',
-            'outtmpl': output_template,
-            'merge_output_format': 'mp4',
-        }
+    # تحديد صيغة الجودة المطلوبة لـ yt-dlp لتشمل جميع المواقع
+    format_selector = 'best'
+    if resolution == "4K":
+        format_selector = 'bestvideo[height<=2160]+bestaudio/best[height<=2160]'
+    elif resolution == "2K":
+        format_selector = 'bestvideo[height<=1440]+bestaudio/best[height<=1440]'
+    elif resolution == "1080p":
+        format_selector = 'bestvideo[height<=1080]+bestaudio/best[height<=1080]'
+    elif resolution == "720p":
+        format_selector = 'bestvideo[height<=720]+bestaudio/best[height<=720]'
+    elif resolution == "480p":
+        format_selector = 'bestvideo[height<=480]+bestaudio/best[height<=480]'
+    elif resolution == "360p":
+        format_selector = 'bestvideo[height<=360]+bestaudio/best[height<=360]'
 
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
+    ydl_opts = {
+        'format': format_selector,
+        'outtmpl': os.path.join(DOWNLOAD_DIR, '%(id)s.%(ext)s'),
+        'geo_bypass': True,          # تجاوز الحظر الجغرافي للمواقع
+        'nocheckcertificate': True,   # تخطي أخطاء الأمان والشهادات
+        'noplaylist': True,
+    }
 
-            if os.path.exists(output_template):
-                with open(output_template, 'rb') as f:
-                    bot.send_video(call.message.chat.id, f, caption=f"✨ تم التحميل بنجاح (جودة {resolution}p) | Cinema Drama plus")
-                os.remove(output_template)
-            else:
-                for file in os.listdir('.'):
-                    if file.startswith(f"video_{user_id}"):
-                        with open(file, 'rb') as f:
-                            bot.send_video(call.message.chat.id, f, caption=f"✨ تم التحميل بنجاح | Cinema Drama plus")
-                        os.remove(file)
-                        break
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(info)
 
-            bot.delete_message(call.message.chat.id, msg.message_id)
-        except Exception as e:
-            bot.edit_message_text(f"⚠️ حدث خطأ أثناء التحميل:\n{e}", call.message.chat.id, msg.message_id)
-            if os.path.exists(output_template):
-                os.remove(output_template)
+        bot.edit_message_text("📤 <b>جاري رفع الفيديو إلى تيليغرام...</b>", call.message.chat.id, msg.message_id, parse_mode="HTML")
+        
+        with open(filename, 'rb') as video_file:
+            bot.send_video(call.message.chat.id, video_file, caption="✅ تم التحميل بنجاح بواسطة بوت قناتك الخارق!")
 
-    elif action_type == 'pl':
-        bot.answer_callback_query(call.id, "بدء تحميل قائمة التشغيل...")
-        msg = bot.send_message(call.message.chat.id, f"📂 جاري سحب قائمة التشغيل كاملة بجودة {resolution}p، قد يستغرق ذلك بعض الوقت...")
+        bot.delete_message(call.message.chat.id, msg.message_id)
+        
+        # تنظيف الملف المؤقت
+        if os.path.exists(filename):
+            os.remove(filename)
 
-        ydl_opts = {
-            'format': f'bestvideo[height<={resolution}]+bestaudio/best[height<={resolution}]/best',
-            'outtmpl': f'playlist_{user_id}_%(title)s.%(ext)s',
-            'merge_output_format': 'mp4',
-        }
+    except Exception as e:
+        bot.edit_message_text(f"⚠️ <b>حدث خطأ أثناء التحميل:</b>\n\n<code>{str(e)}</code>", call.message.chat.id, msg.message_id, parse_mode="HTML")
 
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
-
-            bot.send_message(call.message.chat.id, "✅ تم تحميل قائمة التشغيل وتجهيز الملفات بنجاح لقناتك!")
-            bot.delete_message(call.message.chat.id, msg.message_id)
-            
-            for file in os.listdir('.'):
-                if file.startswith(f"playlist_{user_id}"):
-                    try:
-                        os.remove(file)
-                    except:
-                        pass
-        except Exception as e:
-            bot.edit_message_text(f"⚠️ حدث خطأ أثناء تحميل القائمة:\n{e}", call.message.chat.id, msg.message_id)
-
-bot.infinity_polling()
+# تشغيل البوت
+if __name__ == "__main__":
+    print("Bot is running...")
+    bot.infinity_polling()
