@@ -1,27 +1,23 @@
 import os
+import os
 import telebot
 from telebot import types
 import yt_dlp
 
-# ضع توكن بوتك هنا
-TOKEN = "9183863222:AAE4v7z2s4bNuhMVH1-o48vUqV89C2rDmWA"
+TOKEN = 9183863222:AAE4v7z2s4bNuhMVH1-o48vUqV89C2rDmWA"  # توكنك هنا
 bot = telebot.TeleBot(TOKEN)
 
-# مجلد حفظ التحميلات المؤقتة
 DOWNLOAD_DIR = "downloads"
 if not os.path.exists(DOWNLOAD_DIR):
     os.makedirs(DOWNLOAD_DIR)
 
-# تخزين مؤقت للروابط المرسلة من المستخدمين
 user_links = {}
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
     welcome_text = (
         "أهلاً بك يا بطل في بوت قناتك الخارق! 🔥🎬\n\n"
-        "• أرسل لي **رابط فيديو مفرد** لاختيار الدقة وتحميله من أي منصة (يوتيوب، شاهد، وغيرها).\n"
-        "• أو أرسل لي **رابط قائمة تشغيل (Playlist)** لسحب وتحميل الحلقات دفعة واحدة!\n\n"
-        "جميع الدقات مدعومة (من 4K وحتى 144p)."
+        "• أرسل لي رابط الفيديو وسأقوم بتحميله بدقة ممتازة تناسب القناة وبدون أخطاء حجم الملف."
     )
     bot.reply_to(message, welcome_text)
 
@@ -31,14 +27,14 @@ def handle_url(message):
     user_id = message.from_user.id
     user_links[user_id] = url
 
-    # إنشاء أزرار اختيار الدقات
-    markup = types.InlineKeyboardMarkup(row_width=3)
-    resolutions = ["4K", "2K", "1080p", "720p", "640p", "576p", "468p", "360p", "288p", "244p", "144p"]
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    # حصر الخيارات بدقات آمنة ومستقرة لتجنب مشاكل الحجم والصيغ
+    resolutions = ["720p", "480p", "360p", "أفضل دقة متاحة"]
     
     buttons = [types.InlineKeyboardButton(res, callback_data=f"dl_{res}") for res in resolutions]
     markup.add(*buttons)
 
-    bot.reply_to(message, "🎬 <b>اختر دقة التحميل المطلوبة للحلقة:</b>", parse_mode="HTML", reply_markup=markup)
+    bot.reply_to(message, "🎬 <b>اختر دقة التحميل المناسبة:</b>", parse_mode="HTML", reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("dl_"))
 def download_video(call):
@@ -50,29 +46,24 @@ def download_video(call):
     url = user_links[user_id]
     resolution = call.data.split("_")[1]
 
-    bot.answer_callback_query(call.id, f"جاري بدء التحميل بدقة {resolution}...")
-    msg = bot.send_message(call.message.chat.id, f"⏳ <b>جاري سحب ومعالجة الفيديو (دقة {resolution})... يرجى الانتظار</b>", parse_mode="HTML")
+    bot.answer_callback_query(call.id, f"جاري بدء التحميل...")
+    msg = bot.send_message(call.message.chat.id, f"⏳ <b>جاري سحب ومعالجة الفيديو... يرجى الانتظار</b>", parse_mode="HTML")
 
-    # تحديد صيغة الجودة المطلوبة لـ yt-dlp لتشمل جميع المواقع
-    format_selector = 'best'
-    if resolution == "4K":
-        format_selector = 'bestvideo[height<=2160]+bestaudio/best[height<=2160]'
-    elif resolution == "2K":
-        format_selector = 'bestvideo[height<=1440]+bestaudio/best[height<=1440]'
-    elif resolution == "1080p":
-        format_selector = 'bestvideo[height<=1080]+bestaudio/best[height<=1080]'
-    elif resolution == "720p":
-        format_selector = 'bestvideo[height<=720]+bestaudio/best[height<=720]'
+    # اختيار صيغة آمنة تمنع أخطاء الصيغ غير المتاحة
+    if resolution == "720p":
+        format_selector = 'best[height<=720]/best'
     elif resolution == "480p":
-        format_selector = 'bestvideo[height<=480]+bestaudio/best[height<=480]'
+        format_selector = 'best[height<=480]/best'
     elif resolution == "360p":
-        format_selector = 'bestvideo[height<=360]+bestaudio/best[height<=360]'
+        format_selector = 'best[height<=360]/best'
+    else:
+        format_selector = 'best'
 
     ydl_opts = {
         'format': format_selector,
         'outtmpl': os.path.join(DOWNLOAD_DIR, '%(id)s.%(ext)s'),
-        'geo_bypass': True,          # تجاوز الحظر الجغرافي للمواقع
-        'nocheckcertificate': True,   # تخطي أخطاء الأمان والشهادات
+        'geo_bypass': True,
+        'nocheckcertificate': True,
         'noplaylist': True,
     }
 
@@ -81,21 +72,27 @@ def download_video(call):
             info = ydl.extract_info(url, download=True)
             filename = ydl.prepare_filename(info)
 
+        # التحقق من حجم الملف قبل الرفع لمنع خطأ 413
+        file_size = os.path.getsize(filename) / (1024 * 1024) # بالميغابايت
+        if file_size > 49:
+            bot.edit_message_text(f"⚠️ <b>عذراً، حجم الفيديو ({file_size:.1f}MB) أكبر من الحد المسموح للرفع المباشر (50MB).</b>", call.message.chat.id, msg.message_id, parse_mode="HTML")
+            if os.path.exists(filename):
+                os.remove(filename)
+            return
+
         bot.edit_message_text("📤 <b>جاري رفع الفيديو إلى تيليغرام...</b>", call.message.chat.id, msg.message_id, parse_mode="HTML")
         
         with open(filename, 'rb') as video_file:
-            bot.send_video(call.message.chat.id, video_file, caption="✅ تم التحميل بنجاح بواسطة بوت قناتك الخارق!")
+            bot.send_video(call.message.chat.id, video_file, caption="✅ تم التحميل بنجاح بواسطة بوت قناتك!")
 
         bot.delete_message(call.message.chat.id, msg.message_id)
         
-        # تنظيف الملف المؤقت
         if os.path.exists(filename):
             os.remove(filename)
 
     except Exception as e:
         bot.edit_message_text(f"⚠️ <b>حدث خطأ أثناء التحميل:</b>\n\n<code>{str(e)}</code>", call.message.chat.id, msg.message_id, parse_mode="HTML")
 
-# تشغيل البوت
 if __name__ == "__main__":
     print("Bot is running...")
     bot.infinity_polling()
