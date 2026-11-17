@@ -1,10 +1,9 @@
 import os
-import os
 import telebot
 from telebot import types
 import yt_dlp
 
-TOKEN = 9183863222:AAE4v7z2s4bNuhMVH1-o48vUqV89C2rDmWA"  # توكنك هنا
+TOKEN = "9183863222:AAE4v7z2s4bNuhMVH1-o48VUqV89C2rDmWA"
 bot = telebot.TeleBot(TOKEN)
 
 DOWNLOAD_DIR = "downloads"
@@ -28,8 +27,7 @@ def handle_url(message):
     user_links[user_id] = url
 
     markup = types.InlineKeyboardMarkup(row_width=2)
-    # حصر الخيارات بدقات آمنة ومستقرة لتجنب مشاكل الحجم والصيغ
-    resolutions = ["720p", "480p", "360p", "أفضل دقة متاحة"]
+    resolutions = ["720p", "480p", "360p", "best"]
     
     buttons = [types.InlineKeyboardButton(res, callback_data=f"dl_{res}") for res in resolutions]
     markup.add(*buttons)
@@ -49,7 +47,6 @@ def download_video(call):
     bot.answer_callback_query(call.id, f"جاري بدء التحميل...")
     msg = bot.send_message(call.message.chat.id, f"⏳ <b>جاري سحب ومعالجة الفيديو... يرجى الانتظار</b>", parse_mode="HTML")
 
-    # اختيار صيغة آمنة تمنع أخطاء الصيغ غير المتاحة
     if resolution == "720p":
         format_selector = 'best[height<=720]/best'
     elif resolution == "480p":
@@ -72,8 +69,7 @@ def download_video(call):
             info = ydl.extract_info(url, download=True)
             filename = ydl.prepare_filename(info)
 
-        # التحقق من حجم الملف قبل الرفع لمنع خطأ 413
-        file_size = os.path.getsize(filename) / (1024 * 1024) # بالميغابايت
+        file_size = os.path.getsize(filename) / (1024 * 1024)
         if file_size > 49:
             bot.edit_message_text(f"⚠️ <b>عذراً، حجم الفيديو ({file_size:.1f}MB) أكبر من الحد المسموح للرفع المباشر (50MB).</b>", call.message.chat.id, msg.message_id, parse_mode="HTML")
             if os.path.exists(filename):
