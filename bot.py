@@ -61,20 +61,23 @@ def load_state():
                 return {
                     "series": data.get("series", "أمنية حب"),
                     "next_ep": int(data.get("next_ep", 1)),
-                    "quality": data.get("quality", "HD"),
+                    "quality": data.get("quality", "720p"),
                 }
         except Exception:
             pass
     return {
         "series": "أمنية حب",
         "next_ep": 1,
-        "quality": "HD",
+        "quality": "720p",
     }
 
 
 def save_state(state_data):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(state_data, f, ensure_ascii=False, indent=2)
+    try:
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(state_data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
 
 state = load_state()
@@ -110,7 +113,11 @@ def expand_url(url):
         final_url = resp.url or url
         content_type = (resp.headers.get("Content-Type") or "").lower()
         content_len_raw = resp.headers.get("Content-Length")
-        content_len = int(content_len_raw) if content_len_raw and content_len_raw.isdigit() else 0
+        content_len = (
+            int(content_len_raw)
+            if content_len_raw and content_len_raw.isdigit()
+            else 0
+        )
         resp.close()
         return final_url, content_type, content_len
     except Exception:
@@ -262,7 +269,11 @@ def download_via_ytdlp(url, out_prefix, on_progress):
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
-        est = (info.get("filesize") or info.get("filesize_approx") or 0) if isinstance(info, dict) else 0
+        est = (
+            (info.get("filesize") or info.get("filesize_approx") or 0)
+            if isinstance(info, dict)
+            else 0
+        )
         if est and est > MAX_SIZE_BYTES:
             raise FileTooLargeError("حجم الملف يتجاوز 2GB.")
 
@@ -303,7 +314,6 @@ def download_direct_video(url, out_prefix, on_progress):
             resolved_url, out_prefix, content_type, total_size, on_progress
         )
     except Exception:
-        # محاولة احتياطية عبر yt-dlp إذا كان الرابط صفحة أو بثاً يحتاج معالجة
         return download_via_ytdlp(resolved_url, out_prefix, on_progress)
 
 
@@ -333,4 +343,191 @@ def process_direct_urls(chat_id, status_msg_id, urls):
                     message_id=status_msg_id,
                     parse_mode="Markdown",
                 )
-            
+            except Exception:
+                pass
+
+        update_msg(0.0, "بدء...")
+
+        try:
+            out_prefix = os.path.join(
+                DOWNLOAD_DIR, f"dir_{chat_id}_{idx}_{uuid.uuid4().hex[:6]}"
+            )
+            file_path = download_direct_video(raw_url, out_prefix, update_msg)
+
+            bot.edit_message_text(
+                f"⬆️ **جاري الرفع إلى تلغرام ({idx}/{total_count})**\n"
+                f"🎬 الحلقة: **({ep_str})**",
+                chat_id=chat_id,
+                message_id=status_msg_id,
+                parse_mode="Markdown",
+            )
+
+            with open(file_path, "rb") as vid_file:
+                try:
+                    bot.send_video(
+                        chat_id=chat_id,
+                        video=vid_file,
+                        caption=caption,
+                        supports_streaming=True,
+                        timeout=600,
+                    )
+                except Exception:
+                    vid_file.seek(0)
+                    bot.send_document(
+                        chat_id=chat_id,
+                        document=vid_file,
+                        caption=caption,
+                        timeout=600,
+                    )
+
+            with state_lock:
+                state["next_ep"] = ep_num + 1
+                save_state(state)
+
+            success_count += 1
+
+        except FileTooLargeError:
+            bot.send_message(
+                chat_id,
+                f"⚠️ تم تخطي الحلقة ({ep_str}) لأن حجمها يتجاوز 2GB.",
+            )
+        except Exception as e:
+            bot.send_message(
+                chat_id,
+                f"❌ فشل تحميل/رفع الحلقة ({ep_str}):\n`{str(e)[:300]}`",
+                parse_mode="Markdown",
+            )
+        finally:
+            cleanup_file(file_path)
+
+    with state_lock:
+        next_ep_after = format_ep(state["next_ep"])
+
+    bot.edit_message_text(
+        f"✅ **اكتملت العملية!**\n"
+        f"✔️ تم رفع **{success_count}** من أصل **{total_count}** فيديو.\n"
+        f"🔢 الحلقة القادمة ستكون: **({next_ep_after})**",
+        chat_id=chat_id,
+        message_id=status_msg_id,
+        parse_mode="Markdown",
+    )
+
+
+@bot.message_handler(commands=["start", "help", "status"])
+def send_welcome(message):
+    if not is_authorized_message(message):
+        return
+
+    with state_lock:
+        series_val = state["series"]
+        next_ep_val = format_ep(state["next_ep"])
+        quality_val = state["quality"]
+        current_cap = build_caption(series_val, state["next_ep"], quality_val)
+
+    lock_status = "مفعل 🔒" if ADMIN_ID is not None else "غير مضبوط (أضف ADMIN_ID في Render)"
+
+    text = (
+        "📥 **بوت تحميل الفيديوهات من روابط مباشرة**\n\n"
+        f"🔐 **حماية المالك:** {lock_status}\n"
+        f"📌 **المسلسل الحالي:** {series_val}\n"
+        f"🔢 **الحلقة القادمة:** ({next_ep_val})\n"
+        f"🎞 **الجودة بالكابشن:** ({quality_val})\n"
+        f"📝 **الكابشن القادم:**\n`{current_cap}`\n\n"
+        "**الأوامر المتاحة:**\n"
+        "• `/setseries اسم المسلسل`\n"
+        "• `/setep 1`\n"
+        "• `/setquality 720p`\n"
+        "• `/status`\n\n"
+        "🔗 أرسل **رابط تنزيل مباشر للفيديو** (أو عدة روابط) ليبدأ التحميل والرفع فوراً!"
+    )
+    bot.reply_to(message, text, parse_mode="Markdown")
+
+
+@bot.message_handler(commands=["setseries"])
+def set_series(message):
+    if not is_authorized_message(message):
+        return
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        bot.reply_to(message, "⚠️ مثال:\n`/setseries أمنية حب`", parse_mode="Markdown")
+        return
+    with state_lock:
+        state["series"] = parts[1].strip()
+        save_state(state)
+        val = state["series"]
+    bot.reply_to(message, f"✅ تم تحديث اسم المسلسل إلى: **{val}**", parse_mode="Markdown")
+
+
+@bot.message_handler(commands=["setep"])
+def set_episode(message):
+    if not is_authorized_message(message):
+        return
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip().isdigit():
+        bot.reply_to(message, "⚠️ مثال:\n`/setep 1`", parse_mode="Markdown")
+        return
+    ep_val = int(parts[1].strip())
+    if ep_val < 1:
+        bot.reply_to(message, "⚠️ رقم الحلقة يجب أن يكون 1 أو أكثر.")
+        return
+    with state_lock:
+        state["next_ep"] = ep_val
+        save_state(state)
+    bot.reply_to(
+        message,
+        f"✅ تم ضبط الحلقة القادمة لتكون: **({format_ep(ep_val)})**",
+        parse_mode="Markdown",
+    )
+
+
+@bot.message_handler(commands=["setquality"])
+def set_quality(message):
+    if not is_authorized_message(message):
+        return
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        bot.reply_to(message, "⚠️ مثال:\n`/setquality 720p`", parse_mode="Markdown")
+        return
+    with state_lock:
+        state["quality"] = parts[1].strip()
+        save_state(state)
+        val = state["quality"]
+    bot.reply_to(message, f"✅ تم تحديث الجودة بالكابشن إلى: **({val})**", parse_mode="Markdown")
+
+
+@bot.message_handler(func=lambda m: isinstance(m.text, str) and "http" in m.text.lower())
+def handle_direct_links(message):
+    if not is_authorized_message(message):
+        return
+
+    urls = extract_urls_from_text(message.text)
+    if not urls:
+        bot.reply_to(message, "⚠️ لم يتم العثور على رابط صالح.")
+        return
+
+    status_msg = bot.reply_to(
+        message,
+        f"⏳ **تم استلام ({len(urls)}) رابط مباشر، جاري التحميل...**",
+        parse_mode="Markdown",
+    )
+
+    threading.Thread(
+        target=process_direct_urls,
+        args=(message.chat.id, status_msg.message_id, urls),
+        daemon=True,
+    ).start()
+
+
+def run_bot():
+    while True:
+        try:
+            bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=25)
+        except Exception as e:
+            print(f"Polling error: {e}")
+            time.sleep(5)
+
+
+if __name__ == "__main__":
+    threading.Thread(target=run_bot, daemon=True).start()
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
