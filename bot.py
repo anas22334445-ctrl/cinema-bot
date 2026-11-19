@@ -5,14 +5,13 @@ import threading
 import time
 import uuid
 from urllib.parse import urljoin
-from bs4 import BeautifulSoup
 from flask import Flask
 import requests
 import telebot
 from telebot import types
 import yt_dlp
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8956783825:AAHS01rPwSdVztYF-k1jfdk9zGIBnfTqcgw")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "ضع_توكن_البوت_هنا")
 COOKIES_FILE = os.getenv("COOKIES_FILE", "cookies.txt")
 DATA_FILE = "series_state.json"
 DOWNLOAD_DIR = "downloads"
@@ -179,13 +178,15 @@ def scrape_media_urls_from_page(page_url):
             if clean not in found:
                 found.append(clean)
 
-        soup = BeautifulSoup(html, "html.parser")
-        for tag in soup.find_all(["video", "source", "iframe"]):
-            src = tag.get("src") or tag.get("data-src")
-            if src:
-                full = urljoin(page_url, src)
-                if full not in found:
-                    found.append(full)
+        attr_matches = re.findall(
+            r"""(?:src|data-src)\s*=\s*["']([^"']+)["']""",
+            html,
+            flags=re.IGNORECASE,
+        )
+        for src in attr_matches:
+            full = urljoin(page_url, src)
+            if full not in found:
+                found.append(full)
     except Exception:
         pass
     return found
