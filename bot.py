@@ -1,25 +1,31 @@
-import os
+from http
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import os
 import threading
-from flask import Flask
 import telebot
 
-# 👇 ضع توكن البوت هنا أو في متغير BOT_TOKEN داخل Render
+# 👇 ضع توكن البوت هنا داخل علامتي التنصيص أو في متغير BOT_TOKEN داخل Render
 BOT_TOKEN = os.environ.get("BOT_TOKEN") or "8956783825:AAHS01rPwSdVztYF-k1jfdk9zGIBnfTqcgw"
+
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# خادم ويب خفيف لخدمة Web Service في Render
-app = Flask(__name__)
 
+# سيرفر ويب خفيف مدمج في بايثون لخدمة Web Service في Render
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"Bot is running")
 
-@app.route("/")
-def home():
-    return "Bot is running", 200
+    def log_message(self, format, *args):
+        return
 
 
 def run_web():
     port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    server.serve_forever()
 
 
 # لكل مستخدم نحتفظ بإعدادات التسمية الحالية
