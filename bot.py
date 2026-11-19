@@ -6,13 +6,18 @@ import sys
 import threading
 import time
 import uuid
+from urllib.parse import urljoin
 from flask import Flask
+import requests
 import telebot
 from telebot import types
 import yt_dlp
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8956783825:AAHS01rPwSdVztYF-k1jfdk9zGIBnfTqcgw")
 COOKIES_FILE = os.getenv("COOKIES_FILE", "cookies.txt")
+ADMIN_ID_RAW = os.getenv("ADMIN_ID", "").strip()
+ADMIN_ID = int(ADMIN_ID_RAW) if ADMIN_ID_RAW.isdigit() else None
+
 DATA_FILE = "series_state.json"
 DOWNLOAD_DIR = "downloads"
 
@@ -39,7 +44,15 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
 state_lock = threading.Lock()
-pending_playlists = {}
+pending_tasks = {}
+
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
+}
 
 
 class FileTooLargeError(Exception):
@@ -48,7 +61,7 @@ class FileTooLargeError(Exception):
 
 @app.route("/")
 def home():
-    return "YouTube Playlist Bot is alive!", 200
+    return "YouTube & Shahid Playlist Bot is alive!", 200
 
 
 def load_state():
@@ -73,6 +86,16 @@ def save_state(state_data):
 state = load_state()
 
 
+def is_authorized_user(user_id):
+    if ADMIN_ID is None:
+        return True
+    return int(user_id) == ADMIN_ID
+
+
+def is_authorized_message(message):
+    return bool(message.from_user and is_authorized_user(message.from_user.id))
+
+
 def is_youtube_url(url):
     return bool(
         re.match(
@@ -81,6 +104,24 @@ def is_youtube_url(url):
             flags=re.IGNORECASE,
         )
     )
+
+
+def is_shahid_url(url):
+    return bool(
+        re.match(
+            r"^https?://([a-z0-9-]+\.)*(shahid\.mbc\.net|mbc\.net)/.+",
+            url.strip(),
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def detect_source_type(url):
+    if is_youtube_url(url):
+        return "youtube"
+    if is_shahid_url(url):
+        return "shahid"
+    return None
 
 
 def format_ep(num):
@@ -151,22 +192,20 @@ def build_format_selector(quality_code):
     )
 
 
-def get_base_ydl_opts():
+def get_base_ydl_opts(referer=None):
+    headers = dict(BROWSER_HEADERS)
+    if referer:
+        headers["Referer"] = referer
+
     opts = {
         "quiet": True,
         "no_warnings": True,
         "socket_timeout": 30,
         "retries": 3,
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-            ),
-            "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
-        },
+        "http_headers": headers,
         "extractor_args": {
             "youtube": {
-                "player_client": ["android", "web", "tv"],
+                "player_client": ["android", "mweb", "web", "tv"],
             }
         },
     }
@@ -175,14 +214,126 @@ def get_base_ydl_opts():
     return opts
 
 
-def extract_playlist_entries(playlist_url):
+def scrape_shahid_entries(page_url):
+    entries = []
+    seen_urls = set()
+
+    try:
+        resp = requests.get(page_url, headers=BROWSER_HEADERS, timeout=20)
+        resp.raise_for_status()
+        html = resp.text
+
+        # استخراج روابط حلقات أو صفحات داخل شاهد إن وُجدت في الصفحة
+        ep_links = re.findall(
+            r"""https?://(?:www\.)?shahid\.mbc\.net/[^\s"'<>\\)]*(?:episode|حلقة|season|موسم)[^\s"'<>\\)]*""",
+            html,
+            flags=re.IGNORECASE,
+        )
+        for link in ep_links:
+            clean = link.replace("\\/", "/").split('"')[0]
+            if clean not in seen_urls:
+                seen_urls.add(clean)
+                entries.append(
+                    {
+                        "index": len(entries) + 1,
+                        "title": f"حلقة شاهد {len(entries) + 1}",
+                        "url": clean,
+                        "referer": page_url,
+                    }
+                )
+
+        # استخراج روابط m3u8 أو mp4 مباشرة إن وُجدت
+        media_links = re.findall(
+            r"""https?://[^\s"'<>\\)]+\.(?:m3u8|mp4)(?:\?[^\s"'<>\\)]*)?""",
+            html,
+            flags=re.IGNORECASE,
+        )
+        for m_link in media_links:
+            clean = m_link.replace("\\/", "/")
+            if clean not in seen_urls:
+                seen_urls.add(clean)
+                entries.append(
+                    {
+                        "index": len(entries) + 1,
+                        "title": f"بث شاهد {len(entries) + 1}",
+                        "url": clean,
+                        "referer": page_url,
+                    }
+                )
+
+        # استخراج أي src نسبي
+        for src in re.findall(
+            r"""(?:src|data-src)\s*=\s*["']([^"']+\.(?:m3u8|mp4)[^"']*)["']""",
+            html,
+            flags=re.IGNORECASE,
+        ):
+            full = urljoin(page_url, src)
+            if full not in seen_urls:
+                seen_urls.add(full)
+                entries.append(
+                    {
+                        "index": len(entries) + 1,
+                        "title": f"بث شاهد {len(entries) + 1}",
+                        "url": full,
+                        "referer": page_url,
+                    }
+                )
+    except Exception:
+        pass
+
+    if not entries:
+        entries.append(
+            {
+                "index": 1,
+                "title": "رابط شاهد",
+                "url": page_url,
+                "referer": page_url,
+            }
+        )
+
+    return entries
+
+
+def extract_playlist_entries(url, source_type):
+    if source_type == "shahid":
+        # نحاول أولاً عبر yt-dlp لمعرفة إذا كان يدعم الرابط أو القائمة مباشرة
+        try:
+            opts = {
+                **get_base_ydl_opts(referer=url),
+                "extract_flat": "in_playlist",
+                "noplaylist": False,
+            }
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+            if isinstance(info, dict) and info.get("entries"):
+                entries = []
+                for idx, item in enumerate(info["entries"], start=1):
+                    if not item:
+                        continue
+                    v_url = item.get("url") or item.get("webpage_url")
+                    if v_url:
+                        entries.append(
+                            {
+                                "index": idx,
+                                "title": item.get("title") or f"حلقة {idx}",
+                                "url": v_url,
+                                "referer": url,
+                            }
+                        )
+                if entries:
+                    return entries
+        except Exception:
+            pass
+
+        return scrape_shahid_entries(url)
+
     opts = {
         **get_base_ydl_opts(),
         "extract_flat": "in_playlist",
         "noplaylist": False,
     }
     with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(playlist_url, download=False)
+        info = ydl.extract_info(url, download=False)
 
     entries = []
     if isinstance(info, dict) and info.get("entries"):
@@ -201,6 +352,7 @@ def extract_playlist_entries(playlist_url):
                         "index": idx,
                         "title": item.get("title") or f"فيديو {idx}",
                         "url": vid_url,
+                        "referer": url,
                     }
                 )
     elif isinstance(info, dict) and info.get("webpage_url"):
@@ -209,6 +361,7 @@ def extract_playlist_entries(playlist_url):
                 "index": 1,
                 "title": info.get("title") or "فيديو 1",
                 "url": info["webpage_url"],
+                "referer": url,
             }
         )
 
@@ -223,7 +376,7 @@ def find_downloaded_file(out_prefix, info=None, ydl=None):
         except Exception:
             pass
 
-    for ext in (".mp4", ".mkv", ".webm", ".mov", ".m4v"):
+    for ext in (".mp4", ".mkv", ".webm", ".mov", ".m4v", ".ts"):
         candidates.append(out_prefix + ext)
 
     prefix_base = os.path.basename(out_prefix)
@@ -238,7 +391,7 @@ def find_downloaded_file(out_prefix, info=None, ydl=None):
 
 
 def download_single_video_with_progress(
-    video_url, out_prefix, quality_code, on_progress
+    video_url, out_prefix, quality_code, on_progress, referer=None
 ):
     last_update_ts = [0.0]
 
@@ -260,7 +413,7 @@ def download_single_video_with_progress(
             on_progress(100.0, "اكتمل")
 
     ydl_opts = {
-        **get_base_ydl_opts(),
+        **get_base_ydl_opts(referer=referer),
         "format": build_format_selector(quality_code),
         "merge_output_format": "mp4",
         "outtmpl": f"{out_prefix}.%(ext)s",
@@ -286,22 +439,25 @@ def download_single_video_with_progress(
         return file_path
 
 
-def run_ordered_playlist_download(chat_id, status_msg_id, playlist_url, quality_code):
+def run_ordered_playlist_download(
+    chat_id, status_msg_id, url, source_type, quality_code
+):
     quality_label = (
         "HD" if quality_code == "best" else QUALITY_MAP[quality_code][0].split()[0]
     )
+    source_label = "شاهد MBC" if source_type == "shahid" else "يوتيوب"
 
     try:
         bot.edit_message_text(
-            "🔎 جاري جلب حلقات قائمة التشغيل من يوتيوب بالترتيب...",
+            f"🔎 جاري جلب الحلقات من ({source_label}) بالترتيب...",
             chat_id=chat_id,
             message_id=status_msg_id,
         )
 
-        entries = extract_playlist_entries(playlist_url)
+        entries = extract_playlist_entries(url, source_type)
         if not entries:
             bot.edit_message_text(
-                "⚠️ لم يتم العثور على فيديوهات في هذه القائمة (تأكد أن الرابط قائمة تشغيل يوتيوب صحيحة وأن الكوكيز مرفوعة إذا كانت خاصة).",
+                f"⚠️ لم يتم العثور على حلقات قابلة للاستخراج من رابط ({source_label}) (قد يكون المحتوى محمياً بتشفير DRM أو يتطلب جلسة/كوكيز).",
                 chat_id=chat_id,
                 message_id=status_msg_id,
             )
@@ -314,6 +470,7 @@ def run_ordered_playlist_download(chat_id, status_msg_id, playlist_url, quality_
             file_path = None
             vid_title = item["title"][:50]
             vid_url = item["url"]
+            vid_referer = item.get("referer")
 
             with state_lock:
                 ep_num = state["next_ep"]
@@ -327,7 +484,7 @@ def run_ordered_playlist_download(chat_id, status_msg_id, playlist_url, quality_
             def update_dl_msg(pct, speed_str):
                 try:
                     bot.edit_message_text(
-                        f"📥 **تحميل بالترتيب ({pos}/{total_count})**\n"
+                        f"📥 **تحميل بالترتيب من {source_label} ({pos}/{total_count})**\n"
                         f"🎬 الحلقة: **({ep_str})** — {vid_title}\n"
                         f"🎞 الجودة: **({quality_label})**\n"
                         f"📊 التقدم: `{build_progress_bar(pct)}`\n"
@@ -346,7 +503,11 @@ def run_ordered_playlist_download(chat_id, status_msg_id, playlist_url, quality_
                     DOWNLOAD_DIR, f"pl_{chat_id}_{pos}_{uuid.uuid4().hex[:6]}"
                 )
                 file_path = download_single_video_with_progress(
-                    vid_url, out_prefix, quality_code, update_dl_msg
+                    vid_url,
+                    out_prefix,
+                    quality_code,
+                    update_dl_msg,
+                    referer=vid_referer,
                 )
 
                 bot.edit_message_text(
@@ -387,9 +548,13 @@ def run_ordered_playlist_download(chat_id, status_msg_id, playlist_url, quality_
                     f"⚠️ تم تخطي الحلقة ({ep_str}) ({vid_title}) لأن حجمها يتجاوز 2GB.",
                 )
             except Exception as e:
+                err_txt = str(e)
+                hint = ""
+                if source_type == "shahid":
+                    hint = "\n💡 ملاحظة: حلقات شاهد غالباً تستخدم تشفير DRM أو جلسة حماية لا تسمح بالتحميل المباشر من السيرفر."
                 bot.send_message(
                     chat_id,
-                    f"❌ فشل تحميل/رفع الحلقة ({ep_str}) ({vid_title}):\n`{str(e)[:300]}`",
+                    f"❌ فشل تحميل/رفع الحلقة ({ep_str}) ({vid_title}):\n`{err_txt[:260]}`{hint}",
                     parse_mode="Markdown",
                 )
             finally:
@@ -399,7 +564,7 @@ def run_ordered_playlist_download(chat_id, status_msg_id, playlist_url, quality_
             next_ep_after = format_ep(state["next_ep"])
 
         bot.edit_message_text(
-            f"✅ **اكتملت قائمة التشغيل!**\n"
+            f"✅ **اكتملت المعالجة من ({source_label})!**\n"
             f"✔️ تم رفع **{success_count}** من أصل **{total_count}** حلقة بالترتيب.\n"
             f"🔢 الحلقة القادمة ستكون: **({next_ep_after})**",
             chat_id=chat_id,
@@ -409,7 +574,7 @@ def run_ordered_playlist_download(chat_id, status_msg_id, playlist_url, quality_
 
     except Exception as e:
         bot.edit_message_text(
-            f"❌ حدث خطأ أثناء معالجة قائمة التشغيل:\n`{str(e)[:400]}`",
+            f"❌ حدث خطأ أثناء معالجة الرابط:\n`{str(e)[:400]}`",
             chat_id=chat_id,
             message_id=status_msg_id,
             parse_mode="Markdown",
@@ -418,33 +583,40 @@ def run_ordered_playlist_download(chat_id, status_msg_id, playlist_url, quality_
 
 @bot.message_handler(commands=["start", "help", "status"])
 def send_welcome(message):
+    if not is_authorized_message(message):
+        return
+
     with state_lock:
         series_val = state["series"]
         next_ep_val = format_ep(state["next_ep"])
         quality_val = state["quality"]
         current_cap = build_caption(series_val, state["next_ep"], quality_val)
 
-    cookies_status = "مفعل ✅" if os.path.exists(COOKIES_FILE) else "غير موجود (للروابط العامة فقط)"
+    cookies_status = "مفعل ✅" if os.path.exists(COOKIES_FILE) else "غير موجود"
+    lock_status = "مفعل 🔒" if ADMIN_ID is not None else "غير مضبوط (أضف ADMIN_ID في Render)"
 
     text = (
-        "🎬 **بوت تحميل قوائم تشغيل يوتيوب بالترتيب**\n\n"
+        "🎬 **بوت تحميل قوائم يوتيوب وشاهد بالترتيب**\n\n"
+        f"🔐 **حماية المالك:** {lock_status}\n"
         f"📌 **المسلسل الحالي:** {series_val}\n"
         f"🔢 **الحلقة القادمة:** ({next_ep_val})\n"
         f"🎞 **الجودة الحالية:** ({quality_val})\n"
-        f"🍪 **ملف الكوكيز (للقوائم الخاصة):** {cookies_status}\n"
+        f"🍪 **ملف الكوكيز:** {cookies_status}\n"
         f"📝 **مثال الكابشن القادم:**\n`{current_cap}`\n\n"
         "**الأوامر المتاحة:**\n"
         "• `/setseries اسم المسلسل`\n"
         "• `/setep 1`\n"
         "• `/setquality 720p`\n"
         "• `/status`\n\n"
-        "📺 أرسل **رابط قائمة تشغيل يوتيوب** لتبدأ باختيار الدقة والتحميل بالترتيب مع شريط التقدم!"
+        "📺 أرسل **رابط قائمة يوتيوب أو رابط شاهد** لبدء التحميل بالترتيب مع شريط التقدم!"
     )
     bot.reply_to(message, text, parse_mode="Markdown")
 
 
 @bot.message_handler(commands=["setseries"])
 def set_series(message):
+    if not is_authorized_message(message):
+        return
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
         bot.reply_to(message, "⚠️ مثال:\n`/setseries أمنية حب`", parse_mode="Markdown")
@@ -458,6 +630,8 @@ def set_series(message):
 
 @bot.message_handler(commands=["setep"])
 def set_episode(message):
+    if not is_authorized_message(message):
+        return
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip().isdigit():
         bot.reply_to(message, "⚠️ مثال:\n`/setep 1`", parse_mode="Markdown")
@@ -478,6 +652,8 @@ def set_episode(message):
 
 @bot.message_handler(commands=["setquality"])
 def set_quality(message):
+    if not is_authorized_message(message):
+        return
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
         bot.reply_to(message, "⚠️ مثال:\n`/setquality 720p`", parse_mode="Markdown")
@@ -491,23 +667,28 @@ def set_quality(message):
 
 @bot.message_handler(func=lambda m: isinstance(m.text, str) and m.text.strip().startswith(("http://", "https://")))
 def handle_url(message):
-    url = message.text.strip().split()[0]
+    if not is_authorized_message(message):
+        return
 
-    if not is_youtube_url(url):
+    url = message.text.strip().split()[0]
+    source_type = detect_source_type(url)
+
+    if not source_type:
         bot.reply_to(
             message,
-            "⚠️ هذا البوت يدعم **قوائم تشغيل يوتيوب حصراً** (`youtube.com` / `youtu.be`).",
+            "⚠️ هذا البوت يدعم روابط **يوتيوب** (`youtube.com` / `youtu.be`) و**شاهد** (`shahid.mbc.net`) فقط.",
             parse_mode="Markdown",
         )
         return
 
+    src_name = "شاهد MBC" if source_type == "shahid" else "يوتيوب"
     task_id = uuid.uuid4().hex[:10]
     with state_lock:
-        pending_playlists[task_id] = url
+        pending_tasks[task_id] = {"url": url, "source_type": source_type}
 
     bot.reply_to(
         message,
-        "🎞 **تم استلام رابط يوتيوب، اختر الدقة المطلوبة للتحميل بالترتيب (حتى 2GB):**",
+        f"🎞 **تم استلام رابط ({src_name})، اختر الدقة المطلوبة للتحميل بالترتيب (حتى 2GB):**",
         reply_markup=build_quality_keyboard(task_id),
         parse_mode="Markdown",
     )
@@ -515,6 +696,10 @@ def handle_url(message):
 
 @bot.callback_query_handler(func=lambda call: call.data and call.data.startswith("pq|"))
 def handle_playlist_quality_callback(call):
+    if not call.from_user or not is_authorized_user(call.from_user.id):
+        bot.answer_callback_query(call.id, "هذا البوت خاص بالمالك فقط.")
+        return
+
     parts = call.data.split("|")
     if len(parts) != 3:
         bot.answer_callback_query(call.id, "طلب غير صالح.")
@@ -522,9 +707,9 @@ def handle_playlist_quality_callback(call):
 
     _, task_id, quality_code = parts
     with state_lock:
-        playlist_url = pending_playlists.pop(task_id, None)
+        task_info = pending_tasks.pop(task_id, None)
 
-    if not playlist_url:
+    if not task_info:
         bot.answer_callback_query(call.id, "انتهت صلاحية الطلب، أرسل الرابط مجدداً.")
         return
 
@@ -534,7 +719,13 @@ def handle_playlist_quality_callback(call):
 
     threading.Thread(
         target=run_ordered_playlist_download,
-        args=(chat_id, msg_id, playlist_url, quality_code),
+        args=(
+            chat_id,
+            msg_id,
+            task_info["url"],
+            task_info["source_type"],
+            quality_code,
+        ),
         daemon=True,
     ).start()
 
@@ -544,8 +735,15 @@ def run_bot():
         subprocess.run(
             [sys.executable, "-m", "pip", "install", "-U", "--pre", "yt-dlp"],
             check=False,
-            timeout=120,
+            timeout=180,
         )
+        ver = subprocess.run(
+            [sys.executable, "-m", "yt_dlp", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        print("yt-dlp version after update:", ver.stdout.strip())
     except Exception as e:
         print(f"yt-dlp auto-update note: {e}")
 
@@ -554,10 +752,4 @@ def run_bot():
             bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=25)
         except Exception as e:
             print(f"Polling error: {e}")
-            time.sleep(5)
-
-
-if __name__ == "__main__":
-    threading.Thread(target=run_bot, daemon=True).start()
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+            time.sleep(5
