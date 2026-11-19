@@ -11,7 +11,7 @@ import telebot
 from telebot import types
 import yt_dlp
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "ضع_توكن_البوت_هنا")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8956783825:AAHS01rPwSdVztYF-k1jfdk9zGIBnfTqcgw")
 COOKIES_FILE = os.getenv("COOKIES_FILE", "cookies.txt")
 DATA_FILE = "series_state.json"
 DOWNLOAD_DIR = "downloads"
@@ -225,6 +225,8 @@ def download_direct_file_up_to_2gb(url, out_prefix, headers=None):
 
 
 def download_from_any_url(url, out_prefix, quality_code):
+    last_yt_error = None
+
     def progress_hook(d):
         if d.get("status") == "downloading":
             downloaded = d.get("downloaded_bytes") or 0
@@ -264,8 +266,8 @@ def download_from_any_url(url, out_prefix, quality_code):
                 return file_path
     except FileTooLargeError:
         raise
-    except Exception:
-        pass
+    except Exception as e:
+        last_yt_error = str(e)
 
     if re.search(r"\.(mp4|mkv|webm|mov|m4v)(\?|$)", url, flags=re.IGNORECASE):
         try:
@@ -296,6 +298,9 @@ def download_from_any_url(url, out_prefix, quality_code):
                     raise
                 except Exception:
                     continue
+
+    if last_yt_error:
+        raise RuntimeError(f"سبب فشل التحميل:\n{last_yt_error[:400]}")
 
     raise RuntimeError(
         "تعذر استخراج أو تنزيل الفيديو من هذا الرابط (قد يكون محمياً بتشفير DRM أو يتطلب تسجيل دخول/كوكيز)."
@@ -491,27 +496,4 @@ def handle_quality_callback(call):
         bot.answer_callback_query(call.id, "انتهت صلاحية هذا الطلب، أرسل الرابط مجدداً.")
         return
 
-    bot.answer_callback_query(call.id, "جاري بدء التحميل...")
-    chat_id = call.message.chat.id
-    msg_id = call.message.message_id
-
-    threading.Thread(
-        target=run_download_and_send,
-        args=(chat_id, msg_id, url, quality_code),
-        daemon=True,
-    ).start()
-
-
-def run_bot():
-    while True:
-        try:
-            bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=25)
-        except Exception as e:
-            print(f"Polling error: {e}")
-            time.sleep(5)
-
-
-if __name__ == "__main__":
-    threading.Thread(target=run_bot, daemon=True).start()
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    bot.answer
