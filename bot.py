@@ -1,6 +1,7 @@
 import telebot
+import telebot
 
-BOT_TOKEN = "ضع_توكن_البوت_هنا"
+BOT_TOKEN = "8956783825:AAHS01rPwSdVztYF-k1jfdk9zGIBnfTqcgw"
 bot = telebot.TeleBot(BOT_TOKEN)
 
 # لكل مستخدم نحتفظ بإعدادات التسمية الحالية
