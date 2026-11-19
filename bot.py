@@ -1,11 +1,12 @@
 import json
 import os
 import re
+import subprocess
+import sys
 import threading
 import time
 import uuid
 from flask import Flask
-import requests
 import telebot
 from telebot import types
 import yt_dlp
@@ -539,6 +540,15 @@ def handle_playlist_quality_callback(call):
 
 
 def run_bot():
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "-U", "--pre", "yt-dlp"],
+            check=False,
+            timeout=120,
+        )
+    except Exception as e:
+        print(f"yt-dlp auto-update note: {e}")
+
     while True:
         try:
             bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=25)
