@@ -4,7 +4,6 @@ import re
 import threading
 import time
 import uuid
-from urllib.parse import urljoin
 from flask import Flask
 import requests
 import telebot
@@ -39,20 +38,16 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
 state_lock = threading.Lock()
-pending_urls = {}
+pending_playlists = {}
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
-    ),
-    "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
-}
+
+class FileTooLargeError(Exception):
+    pass
 
 
 @app.route("/")
 def home():
-    return "Bot is alive!", 200
+    return "YouTube Playlist Bot is alive!", 200
 
 
 def load_state():
@@ -64,7 +59,7 @@ def load_state():
             pass
     return {
         "series": "أمنية حب",
-        "next_ep": 8,
+        "next_ep": 1,
         "quality": "720p",
     }
 
@@ -77,12 +72,14 @@ def save_state(state_data):
 state = load_state()
 
 
-def is_admin_id(user_id):
-    return True
-
-
-def is_admin(message):
-    return True
+def is_youtube_url(url):
+    return bool(
+        re.match(
+            r"^https?://(www\.|m\.|music\.)?(youtube\.com|youtu\.be)/.+",
+            url.strip(),
+            flags=re.IGNORECASE,
+        )
+    )
 
 
 def format_ep(num):
@@ -102,21 +99,33 @@ def cleanup_file(path):
             pass
 
 
-class FileTooLargeError(Exception):
-    pass
+def build_progress_bar(percent):
+    pct = max(0.0, min(100.0, float(percent)))
+    filled = int(pct // 10)
+    return "▓" * filled + "░" * (10 - filled) + f" {pct:.1f}%"
+
+
+def format_speed(speed):
+    if not speed:
+        return "—"
+    if speed >= 1024 * 1024:
+        return f"{speed / (1024 * 1024):.2f} MB/s"
+    if speed >= 1024:
+        return f"{speed / 1024:.1f} KB/s"
+    return f"{speed:.0f} B/s"
 
 
 def build_quality_keyboard(task_id):
     markup = types.InlineKeyboardMarkup(row_width=3)
     buttons = [
-        types.InlineKeyboardButton(text=label, callback_data=f"q|{task_id}|{code}")
+        types.InlineKeyboardButton(text=label, callback_data=f"pq|{task_id}|{code}")
         for code, label, _ in QUALITIES
     ]
     markup.add(*buttons)
     markup.add(
         types.InlineKeyboardButton(
-            text="⚡ أفضل جودة متاحة (حتى 2GB)",
-            callback_data=f"q|{task_id}|best",
+            text="⚡ أفضل جودة متاحة لكل حلقة (حتى 2GB)",
+            callback_data=f"pq|{task_id}|best",
         )
     )
     return markup
@@ -127,6 +136,7 @@ def build_format_selector(quality_code):
         return (
             f"best[ext=mp4][filesize<={MAX_SIZE_BYTES}]/"
             f"best[filesize<={MAX_SIZE_BYTES}]/"
+            f"bestvideo[ext=mp4][filesize<={MAX_SIZE_BYTES}]+bestaudio[ext=m4a]/"
             f"bestvideo[filesize<={MAX_SIZE_BYTES}]+bestaudio/best"
         )
 
@@ -134,9 +144,74 @@ def build_format_selector(quality_code):
     return (
         f"best[ext=mp4][height<={target_h}][filesize<={MAX_SIZE_BYTES}]/"
         f"best[height<={target_h}][filesize<={MAX_SIZE_BYTES}]/"
+        f"bestvideo[ext=mp4][height<={target_h}][filesize<={MAX_SIZE_BYTES}]+bestaudio[ext=m4a]/"
         f"bestvideo[height<={target_h}][filesize<={MAX_SIZE_BYTES}]+bestaudio/"
-        f"best[filesize<={MAX_SIZE_BYTES}]/bestvideo[filesize<={MAX_SIZE_BYTES}]+bestaudio/best"
+        f"best[filesize<={MAX_SIZE_BYTES}]/best"
     )
+
+
+def get_base_ydl_opts():
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "socket_timeout": 30,
+        "retries": 3,
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
+        },
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "web", "tv"],
+            }
+        },
+    }
+    if os.path.exists(COOKIES_FILE):
+        opts["cookiefile"] = COOKIES_FILE
+    return opts
+
+
+def extract_playlist_entries(playlist_url):
+    opts = {
+        **get_base_ydl_opts(),
+        "extract_flat": "in_playlist",
+        "noplaylist": False,
+    }
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(playlist_url, download=False)
+
+    entries = []
+    if isinstance(info, dict) and info.get("entries"):
+        for idx, item in enumerate(info["entries"], start=1):
+            if not item:
+                continue
+            vid_id = item.get("id")
+            vid_url = item.get("url") or (
+                f"https://www.youtube.com/watch?v={vid_id}" if vid_id else None
+            )
+            if vid_url and not vid_url.startswith("http"):
+                vid_url = f"https://www.youtube.com/watch?v={vid_url}"
+            if vid_url:
+                entries.append(
+                    {
+                        "index": idx,
+                        "title": item.get("title") or f"فيديو {idx}",
+                        "url": vid_url,
+                    }
+                )
+    elif isinstance(info, dict) and info.get("webpage_url"):
+        entries.append(
+            {
+                "index": 1,
+                "title": info.get("title") or "فيديو 1",
+                "url": info["webpage_url"],
+            }
+        )
+
+    return entries
 
 
 def find_downloaded_file(out_prefix, info=None, ydl=None):
@@ -147,11 +222,11 @@ def find_downloaded_file(out_prefix, info=None, ydl=None):
         except Exception:
             pass
 
-    for ext in (".mp4", ".mkv", ".webm", ".mov", ".ts", ".m4v"):
+    for ext in (".mp4", ".mkv", ".webm", ".mov", ".m4v"):
         candidates.append(out_prefix + ext)
 
+    prefix_base = os.path.basename(out_prefix)
     for name in os.listdir(DOWNLOAD_DIR):
-        prefix_base = os.path.basename(out_prefix)
         if name.startswith(prefix_base):
             candidates.append(os.path.join(DOWNLOAD_DIR, name))
 
@@ -161,259 +236,214 @@ def find_downloaded_file(out_prefix, info=None, ydl=None):
     return None
 
 
-def scrape_media_urls_from_page(page_url):
-    found = []
-    try:
-        resp = requests.get(page_url, headers=HEADERS, timeout=20)
-        resp.raise_for_status()
-        html = resp.text
-
-        raw_matches = re.findall(
-            r"""https?://[^\s"'<>\\)]+\.(?:m3u8|mp4)(?:\?[^\s"'<>\\)]*)?""",
-            html,
-            flags=re.IGNORECASE,
-        )
-        for m in raw_matches:
-            clean = m.replace("\\/", "/")
-            if clean not in found:
-                found.append(clean)
-
-        attr_matches = re.findall(
-            r"""(?:src|data-src)\s*=\s*["']([^"']+)["']""",
-            html,
-            flags=re.IGNORECASE,
-        )
-        for src in attr_matches:
-            full = urljoin(page_url, src)
-            if full not in found:
-                found.append(full)
-    except Exception:
-        pass
-    return found
-
-
-def download_direct_file_up_to_2gb(url, out_prefix, headers=None):
-    req_headers = dict(HEADERS)
-    if headers:
-        req_headers.update(headers)
-
-    out_path = f"{out_prefix}.mp4"
-    downloaded = 0
-
-    with requests.get(url, headers=req_headers, stream=True, timeout=30) as r:
-        r.raise_for_status()
-        content_len = r.headers.get("Content-Length")
-        if content_len and int(content_len) > MAX_SIZE_BYTES:
-            raise FileTooLargeError("حجم الملف يتجاوز 2GB.")
-
-        with open(out_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 512):
-                if not chunk:
-                    continue
-                downloaded += len(chunk)
-                if downloaded > MAX_SIZE_BYTES:
-                    f.close()
-                    cleanup_file(out_path)
-                    raise FileTooLargeError("حجم الملف يتجاوز 2GB.")
-                f.write(chunk)
-
-    if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
-        cleanup_file(out_path)
-        raise FileNotFoundError("تعذر حفظ ملف الفيديو المباشر.")
-
-    return out_path
-
-
-def download_from_any_url(url, out_prefix, quality_code):
-    last_yt_error = None
+def download_single_video_with_progress(
+    video_url, out_prefix, quality_code, on_progress
+):
+    last_update_ts = [0.0]
 
     def progress_hook(d):
-        if d.get("status") == "downloading":
+        status = d.get("status")
+        if status == "downloading":
             downloaded = d.get("downloaded_bytes") or 0
             total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
             if downloaded > MAX_SIZE_BYTES or total > MAX_SIZE_BYTES:
-                raise FileTooLargeError("حجم الفيديو يتجاوز 2GB.")
+                raise FileTooLargeError("حجم الحلقة يتجاوز 2GB.")
+
+            now = time.time()
+            if now - last_update_ts[0] >= 2.5:
+                last_update_ts[0] = now
+                pct = (downloaded / total * 100.0) if total > 0 else 0.0
+                speed_str = format_speed(d.get("speed"))
+                on_progress(pct, speed_str)
+        elif status == "finished":
+            on_progress(100.0, "اكتمل")
 
     ydl_opts = {
+        **get_base_ydl_opts(),
         "format": build_format_selector(quality_code),
         "merge_output_format": "mp4",
         "outtmpl": f"{out_prefix}.%(ext)s",
         "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
         "progress_hooks": [progress_hook],
-        "http_headers": HEADERS,
-        "socket_timeout": 30,
-        "retries": 3,
     }
 
-    if os.path.exists(COOKIES_FILE):
-        ydl_opts["cookiefile"] = COOKIES_FILE
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(video_url, download=False)
+        est_size = info.get("filesize") or info.get("filesize_approx") or 0
+        if est_size and est_size > MAX_SIZE_BYTES:
+            raise FileTooLargeError("حجم الحلقة يتجاوز 2GB.")
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            est_size = info.get("filesize") or info.get("filesize_approx") or 0
-            if est_size and est_size > MAX_SIZE_BYTES:
-                raise FileTooLargeError("حجم الفيديو يتجاوز 2GB.")
+        ydl.extract_info(video_url, download=True)
+        file_path = find_downloaded_file(out_prefix, info=info, ydl=ydl)
+        if not file_path:
+            raise RuntimeError("تعذر العثور على ملف الفيديو بعد التحميل.")
 
-            info = ydl.extract_info(url, download=True)
-            file_path = find_downloaded_file(out_prefix, info=info, ydl=ydl)
-            if file_path:
-                if os.path.getsize(file_path) > MAX_SIZE_BYTES:
-                    cleanup_file(file_path)
-                    raise FileTooLargeError("حجم الملف النهائي يتجاوز 2GB.")
-                return file_path
-    except FileTooLargeError:
-        raise
-    except Exception as e:
-        last_yt_error = str(e)
+        if os.path.getsize(file_path) > MAX_SIZE_BYTES:
+            cleanup_file(file_path)
+            raise FileTooLargeError("حجم الملف النهائي يتجاوز 2GB.")
 
-    if re.search(r"\.(mp4|mkv|webm|mov|m4v)(\?|$)", url, flags=re.IGNORECASE):
-        try:
-            return download_direct_file_up_to_2gb(url, out_prefix, headers={"Referer": url})
-        except FileTooLargeError:
-            raise
-        except Exception:
-            pass
+        return file_path
 
-    candidate_urls = scrape_media_urls_from_page(url)
-    for cand in candidate_urls:
-        try:
-            with yt_dlp.YoutubeDL({**ydl_opts, "http_headers": {**HEADERS, "Referer": url}}) as ydl:
-                info = ydl.extract_info(cand, download=True)
-                file_path = find_downloaded_file(out_prefix, info=info, ydl=ydl)
-                if file_path:
-                    if os.path.getsize(file_path) > MAX_SIZE_BYTES:
-                        cleanup_file(file_path)
-                        raise FileTooLargeError("حجم الملف النهائي يتجاوز 2GB.")
-                    return file_path
-        except FileTooLargeError:
-            raise
-        except Exception:
-            if cand.lower().split("?")[0].endswith(".mp4"):
-                try:
-                    return download_direct_file_up_to_2gb(cand, out_prefix, headers={"Referer": url})
-                except FileTooLargeError:
-                    raise
-                except Exception:
-                    continue
 
-    if last_yt_error:
-        raise RuntimeError(f"سبب فشل التحميل:\n{last_yt_error[:400]}")
-
-    raise RuntimeError(
-        "تعذر استخراج أو تنزيل الفيديو من هذا الرابط (قد يكون محمياً بتشفير DRM أو يتطلب تسجيل دخول/كوكيز)."
+def run_ordered_playlist_download(chat_id, status_msg_id, playlist_url, quality_code):
+    quality_label = (
+        "HD" if quality_code == "best" else QUALITY_MAP[quality_code][0].split()[0]
     )
 
-
-def run_download_and_send(chat_id, status_msg_id, url, quality_code):
-    file_path = None
-    if quality_code == "best":
-        quality_label = "HD"
-    else:
-        quality_label = QUALITY_MAP[quality_code][0].split()[0]
-
     try:
         bot.edit_message_text(
-            f"⏳ جاري تنزيل الفيديو بدقة ({quality_label}) — الحد الأقصى 2GB...",
+            "🔎 جاري جلب حلقات قائمة التشغيل من يوتيوب بالترتيب...",
             chat_id=chat_id,
             message_id=status_msg_id,
         )
 
-        out_prefix = os.path.join(DOWNLOAD_DIR, f"vid_{chat_id}_{uuid.uuid4().hex[:8]}")
-        file_path = download_from_any_url(url, out_prefix, quality_code)
+        entries = extract_playlist_entries(playlist_url)
+        if not entries:
+            bot.edit_message_text(
+                "⚠️ لم يتم العثور على فيديوهات في هذه القائمة (تأكد أن الرابط قائمة تشغيل يوتيوب صحيحة وأن الكوكيز مرفوعة إذا كانت خاصة).",
+                chat_id=chat_id,
+                message_id=status_msg_id,
+            )
+            return
 
-        bot.edit_message_text(
-            "⬆️ تم التنزيل، جاري رفع الفيديو إلى تلغرام...",
-            chat_id=chat_id,
-            message_id=status_msg_id,
-        )
+        total_count = len(entries)
+        success_count = 0
 
-        with state_lock:
-            ep_num = state["next_ep"]
-            series_name = state["series"]
-            state["quality"] = quality_label
-            save_state(state)
+        for pos, item in enumerate(entries, start=1):
+            file_path = None
+            vid_title = item["title"][:50]
+            vid_url = item["url"]
+
+            with state_lock:
+                ep_num = state["next_ep"]
+                series_name = state["series"]
+                state["quality"] = quality_label
+                save_state(state)
+
+            ep_str = format_ep(ep_num)
             caption = build_caption(series_name, ep_num, quality_label)
 
-        with open(file_path, "rb") as vid_file:
+            def update_dl_msg(pct, speed_str):
+                try:
+                    bot.edit_message_text(
+                        f"📥 **تحميل بالترتيب ({pos}/{total_count})**\n"
+                        f"🎬 الحلقة: **({ep_str})** — {vid_title}\n"
+                        f"🎞 الجودة: **({quality_label})**\n"
+                        f"📊 التقدم: `{build_progress_bar(pct)}`\n"
+                        f"⚡ السرعة: `{speed_str}`",
+                        chat_id=chat_id,
+                        message_id=status_msg_id,
+                        parse_mode="Markdown",
+                    )
+                except Exception:
+                    pass
+
+            update_dl_msg(0.0, "بدء...")
+
             try:
-                bot.send_video(
-                    chat_id=chat_id,
-                    video=vid_file,
-                    caption=caption,
-                    supports_streaming=True,
-                    timeout=600,
+                out_prefix = os.path.join(
+                    DOWNLOAD_DIR, f"pl_{chat_id}_{pos}_{uuid.uuid4().hex[:6]}"
                 )
-            except Exception:
-                vid_file.seek(0)
-                bot.send_document(
-                    chat_id=chat_id,
-                    document=vid_file,
-                    caption=caption,
-                    timeout=600,
+                file_path = download_single_video_with_progress(
+                    vid_url, out_prefix, quality_code, update_dl_msg
                 )
+
+                bot.edit_message_text(
+                    f"⬆️ **جاري الرفع إلى تلغرام ({pos}/{total_count})**\n"
+                    f"🎬 الحلقة: **({ep_str})** — {vid_title}",
+                    chat_id=chat_id,
+                    message_id=status_msg_id,
+                    parse_mode="Markdown",
+                )
+
+                with open(file_path, "rb") as vid_file:
+                    try:
+                        bot.send_video(
+                            chat_id=chat_id,
+                            video=vid_file,
+                            caption=caption,
+                            supports_streaming=True,
+                            timeout=600,
+                        )
+                    except Exception:
+                        vid_file.seek(0)
+                        bot.send_document(
+                            chat_id=chat_id,
+                            document=vid_file,
+                            caption=caption,
+                            timeout=600,
+                        )
+
+                with state_lock:
+                    state["next_ep"] = ep_num + 1
+                    save_state(state)
+
+                success_count += 1
+
+            except FileTooLargeError:
+                bot.send_message(
+                    chat_id,
+                    f"⚠️ تم تخطي الحلقة ({ep_str}) ({vid_title}) لأن حجمها يتجاوز 2GB.",
+                )
+            except Exception as e:
+                bot.send_message(
+                    chat_id,
+                    f"❌ فشل تحميل/رفع الحلقة ({ep_str}) ({vid_title}):\n`{str(e)[:300]}`",
+                    parse_mode="Markdown",
+                )
+            finally:
+                cleanup_file(file_path)
 
         with state_lock:
-            state["next_ep"] = ep_num + 1
-            save_state(state)
-            next_ep_str = format_ep(state["next_ep"])
+            next_ep_after = format_ep(state["next_ep"])
 
         bot.edit_message_text(
-            f"✔️ تم تجهيز الحلقة ({format_ep(ep_num)}) بدقة ({quality_label}) — التالية ستكون ({next_ep_str})",
-            chat_id=chat_id,
-            message_id=status_msg_id,
-        )
-
-    except FileTooLargeError:
-        bot.edit_message_text(
-            "⚠️ حجم الفيديو أكبر من 2GB المسموح به.",
-            chat_id=chat_id,
-            message_id=status_msg_id,
-        )
-    except Exception as e:
-        bot.edit_message_text(
-            f"❌ فشل التنزيل أو الرفع:\n`{e}`",
+            f"✅ **اكتملت قائمة التشغيل!**\n"
+            f"✔️ تم رفع **{success_count}** من أصل **{total_count}** حلقة بالترتيب.\n"
+            f"🔢 الحلقة القادمة ستكون: **({next_ep_after})**",
             chat_id=chat_id,
             message_id=status_msg_id,
             parse_mode="Markdown",
         )
-    finally:
-        cleanup_file(file_path)
+
+    except Exception as e:
+        bot.edit_message_text(
+            f"❌ حدث خطأ أثناء معالجة قائمة التشغيل:\n`{str(e)[:400]}`",
+            chat_id=chat_id,
+            message_id=status_msg_id,
+            parse_mode="Markdown",
+        )
 
 
 @bot.message_handler(commands=["start", "help", "status"])
 def send_welcome(message):
-    if not is_admin(message):
-        return
-
     with state_lock:
-        current_cap = build_caption(state["series"], state["next_ep"], state["quality"])
         series_val = state["series"]
         next_ep_val = format_ep(state["next_ep"])
         quality_val = state["quality"]
+        current_cap = build_caption(series_val, state["next_ep"], quality_val)
+
+    cookies_status = "مفعل ✅" if os.path.exists(COOKIES_FILE) else "غير موجود (للروابط العامة فقط)"
 
     text = (
-        "🎬 **بوت تحميل وترقيم حلقات المسلسلات**\n\n"
+        "🎬 **بوت تحميل قوائم تشغيل يوتيوب بالترتيب**\n\n"
         f"📌 **المسلسل الحالي:** {series_val}\n"
         f"🔢 **الحلقة القادمة:** ({next_ep_val})\n"
         f"🎞 **الجودة الحالية:** ({quality_val})\n"
-        f"📝 **الكابشن القادم:**\n`{current_cap}`\n\n"
+        f"🍪 **ملف الكوكيز (للقوائم الخاصة):** {cookies_status}\n"
+        f"📝 **مثال الكابشن القادم:**\n`{current_cap}`\n\n"
         "**الأوامر المتاحة:**\n"
         "• `/setseries اسم المسلسل`\n"
-        "• `/setep 9`\n"
+        "• `/setep 1`\n"
         "• `/setquality 720p`\n"
         "• `/status`\n\n"
-        "🌐 أرسل **أي رابط** وستظهر لك أزرار الدقات (4K حتى 144p)!"
+        "📺 أرسل **رابط قائمة تشغيل يوتيوب** لتبدأ باختيار الدقة والتحميل بالترتيب مع شريط التقدم!"
     )
     bot.reply_to(message, text, parse_mode="Markdown")
 
 
 @bot.message_handler(commands=["setseries"])
 def set_series(message):
-    if not is_admin(message):
-        return
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
         bot.reply_to(message, "⚠️ مثال:\n`/setseries أمنية حب`", parse_mode="Markdown")
@@ -427,11 +457,9 @@ def set_series(message):
 
 @bot.message_handler(commands=["setep"])
 def set_episode(message):
-    if not is_admin(message):
-        return
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip().isdigit():
-        bot.reply_to(message, "⚠️ مثال:\n`/setep 8`", parse_mode="Markdown")
+        bot.reply_to(message, "⚠️ مثال:\n`/setep 1`", parse_mode="Markdown")
         return
     ep_val = int(parts[1].strip())
     if ep_val < 1:
@@ -440,13 +468,15 @@ def set_episode(message):
     with state_lock:
         state["next_ep"] = ep_val
         save_state(state)
-    bot.reply_to(message, f"✅ تم ضبط الحلقة القادمة لتكون: **({format_ep(ep_val)})**", parse_mode="Markdown")
+    bot.reply_to(
+        message,
+        f"✅ تم ضبط الحلقة القادمة لتكون: **({format_ep(ep_val)})**",
+        parse_mode="Markdown",
+    )
 
 
 @bot.message_handler(commands=["setquality"])
 def set_quality(message):
-    if not is_admin(message):
-        return
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
         bot.reply_to(message, "⚠️ مثال:\n`/setquality 720p`", parse_mode="Markdown")
@@ -459,30 +489,31 @@ def set_quality(message):
 
 
 @bot.message_handler(func=lambda m: isinstance(m.text, str) and m.text.strip().startswith(("http://", "https://")))
-def handle_url_message(message):
-    if not is_admin(message):
+def handle_url(message):
+    url = message.text.strip().split()[0]
+
+    if not is_youtube_url(url):
+        bot.reply_to(
+            message,
+            "⚠️ هذا البوت يدعم **قوائم تشغيل يوتيوب حصراً** (`youtube.com` / `youtu.be`).",
+            parse_mode="Markdown",
+        )
         return
 
-    url = message.text.strip().split()[0]
     task_id = uuid.uuid4().hex[:10]
-
     with state_lock:
-        pending_urls[task_id] = url
+        pending_playlists[task_id] = url
 
     bot.reply_to(
         message,
-        "🎞 **اختر دقة التحميل المطلوبة (الحد الأقصى 2GB):**",
+        "🎞 **تم استلام رابط يوتيوب، اختر الدقة المطلوبة للتحميل بالترتيب (حتى 2GB):**",
         reply_markup=build_quality_keyboard(task_id),
         parse_mode="Markdown",
     )
 
 
-@bot.callback_query_handler(func=lambda call: call.data and call.data.startswith("q|"))
-def handle_quality_callback(call):
-    if not call.from_user or not is_admin_id(call.from_user.id):
-        bot.answer_callback_query(call.id, "غير مصرح لك.")
-        return
-
+@bot.callback_query_handler(func=lambda call: call.data and call.data.startswith("pq|"))
+def handle_playlist_quality_callback(call):
     parts = call.data.split("|")
     if len(parts) != 3:
         bot.answer_callback_query(call.id, "طلب غير صالح.")
@@ -490,10 +521,33 @@ def handle_quality_callback(call):
 
     _, task_id, quality_code = parts
     with state_lock:
-        url = pending_urls.pop(task_id, None)
+        playlist_url = pending_playlists.pop(task_id, None)
 
-    if not url:
-        bot.answer_callback_query(call.id, "انتهت صلاحية هذا الطلب، أرسل الرابط مجدداً.")
+    if not playlist_url:
+        bot.answer_callback_query(call.id, "انتهت صلاحية الطلب، أرسل الرابط مجدداً.")
         return
 
-    bot.answer
+    bot.answer_callback_query(call.id, "جاري بدء التحميل بالترتيب...")
+    chat_id = call.message.chat.id
+    msg_id = call.message.message_id
+
+    threading.Thread(
+        target=run_ordered_playlist_download,
+        args=(chat_id, msg_id, playlist_url, quality_code),
+        daemon=True,
+    ).start()
+
+
+def run_bot():
+    while True:
+        try:
+            bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=25)
+        except Exception as e:
+            print(f"Polling error: {e}")
+            time.sleep(5)
+
+
+if __name__ == "__main__":
+    threading.Thread(target=run_bot, daemon=True).start()
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
