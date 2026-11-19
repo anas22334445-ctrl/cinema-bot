@@ -1,3 +1,4 @@
+
 import json
 import os
 import re
@@ -21,7 +22,10 @@ DOWNLOAD_DIR = "downloads"
 DEFAULT_COVER_FILE = "cover.jpg"
 
 MAX_SIZE_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
+MAX_THUMB_SOURCE_BYTES = 750 * 1024 * 1024
 CHUNK_SIZE = 1024 * 512  # 512 KB
+
+FALLBACK_HEIGHTS = [1080, 720, 480, 360, 240]
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
@@ -55,7 +59,49 @@ class FileTooLargeError(Exception):
 
 @app.route("/")
 def home():
-    return "Direct Video Bot with Available Qualities is alive!", 200
+    return "Direct Video Bot (Multi-Quality Buttons + 2GB) is alive!", 200
+
+
+def safe_send_message(chat_id, text, parse_mode=None, reply_to_message_id=None, reply_markup=None):
+    try:
+        return bot.send_message(
+            chat_id,
+            text,
+            parse_mode=parse_mode,
+            reply_to_message_id=reply_to_message_id,
+            reply_markup=reply_markup,
+        )
+    except Exception:
+        try:
+            return bot.send_message(
+                chat_id,
+                text,
+                reply_to_message_id=reply_to_message_id,
+                reply_markup=reply_markup,
+            )
+        except Exception:
+            return None
+
+
+def safe_edit_message(chat_id, message_id, text, parse_mode=None, reply_markup=None):
+    try:
+        return bot.edit_message_text(
+            text,
+            chat_id=chat_id,
+            message_id=message_id,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup,
+        )
+    except Exception:
+        try:
+            return bot.edit_message_text(
+                text,
+                chat_id=chat_id,
+                message_id=message_id,
+                reply_markup=reply_markup,
+            )
+        except Exception:
+            return None
 
 
 def load_state():
@@ -195,89 +241,10 @@ def is_hls_or_stream_url(url, content_type):
 
 def probe_media_info(file_path):
     duration_sec = 0
+    file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
     has_ffmpeg = shutil.which("ffmpeg") is not None
     has_ffprobe = shutil.which("ffprobe") is not None
 
-    if has_ffprobe:
+    if has_ffprobe and file_size <= MAX_THUMB_SOURCE_BYTES:
         try:
-            res = subprocess.run(
-                [
-                    "ffprobe",
-                    "-v",
-                    "error",
-                    "-show_entries",
-                    "format=duration",
-                    "-of",
-                    "default=noprint_wrappers=1:nokey=1",
-                    file_path,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=15,
-            )
-            val = float(res.stdout.strip())
-            if val > 0:
-                duration_sec = int(round(val))
-        except Exception:
-            pass
-
-    thumb_path = None
-    if has_ffmpeg:
-        candidate_thumb = f"{file_path}_thumb.jpg"
-        seek_pos = "00:00:05" if duration_sec > 10 else "00:00:01"
-        try:
-            subprocess.run(
-                [
-                    "ffmpeg",
-                    "-y",
-                    "-ss",
-                    seek_pos,
-                    "-i",
-                    file_path,
-                    "-frames:v",
-                    "1",
-                    "-vf",
-                    "scale=320:-1",
-                    "-q:v",
-                    "4",
-                    candidate_thumb,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=20,
-            )
-            if os.path.exists(candidate_thumb) and os.path.getsize(candidate_thumb) > 0:
-                thumb_path = candidate_thumb
-            else:
-                cleanup_file(candidate_thumb)
-        except Exception:
-            cleanup_file(candidate_thumb)
-
-    if not thumb_path and os.path.exists(DEFAULT_COVER_FILE):
-        thumb_path = DEFAULT_COVER_FILE
-
-    return duration_sec, thumb_path
-
-
-def inspect_available_qualities(url):
-    """يفحص الدقات المتوفرة فعلاً في الرابط دون تحميل أو تحويل."""
-    resolved_url, content_type, _ = expand_url(url)
-    opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "socket_timeout": 20,
-        "http_headers": {**BROWSER_HEADERS, "Referer": url},
-    }
-    heights = set()
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(resolved_url, download=False)
-        if isinstance(info, dict):
-            if info.get("entries"):
-                first = next((e for e in info["entries"] if isinstance(e, dict)), None)
-                if first:
-                    info = first
-            for f in info.get("formats") or []:
-                if not isinstance(f, dict):
-                    continue
-                vcodec = f.get("vcodec")
+            
