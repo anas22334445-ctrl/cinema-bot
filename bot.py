@@ -1,135 +1,179 @@
-from http
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import json
+import json
 import os
-import threading
 import telebot
 
-# 👇 ضع توكن البوت هنا داخل علامتي التنصيص أو في متغير BOT_TOKEN داخل Render
-BOT_TOKEN = os.environ.get("BOT_TOKEN") or "8956783825:AAHS01rPwSdVztYF-k1jfdk9zGIBnfTqcgw"
+# ضع توكن البوت هنا أو في متغيرات البيئة (Environment Variables)
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8956783825:AAHS01rPwSdVztYF-k1jfdk9zGIBnfTqcgw")
+
+# ضع آيدي حسابك (أدمن البوت) كرقم صحيح، مثل: 123456789
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+
+DATA_FILE = "series_state.json"
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
 
-# سيرفر ويب خفيف مدمج في بايثون لخدمة Web Service في Render
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/plain; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(b"Bot is running")
+def load_state():
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    # يبدأ من الحلقة 8 لأنك حددتها في مثالك
+    return {
+        "series": "أمنية حب",
+        "next_ep": 8,
+        "quality": "HD",
+    }
 
-    def log_message(self, format, *args):
+
+def save_state(state):
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+
+state = load_state()
+
+
+def is_admin(message):
+    if ADMIN_ID == 0:
+        return True
+    return message.from_user and message.from_user.id == ADMIN_ID
+
+
+def format_ep(num):
+    num_int = int(num)
+    return f"{num_int:02d}" if num_int < 100 else str(num_int)
+
+
+def build_caption(series_name, ep_num, quality):
+    return f"{series_name} — الحلقة ({format_ep(ep_num)}) — الجودة ({quality})"
+
+
+@bot.message_handler(commands=["start", "help", "status"])
+def send_welcome(message):
+    if not is_admin(message):
         return
 
-
-def run_web():
-    port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    server.serve_forever()
-
-
-# لكل مستخدم نحتفظ بإعدادات التسمية الحالية
-user_sessions = {}
-
-
-def format_ep(num: int) -> str:
-    return f"{num:02d}"
-
-
-def build_caption(session: dict, num: int) -> str:
-    ep_str = format_ep(num)
-    return f"مسلسل {session['series']} | الحلقة ({ep_str}) | {session['quality']}"
-
-
-@bot.message_handler(commands=["start", "help"])
-def send_welcome(message):
+    current_cap = build_caption(state["series"], state["next_ep"], state["quality"])
     text = (
-        "أهلاً بك 👋\n\n"
-        "طريقة العمل:\n"
-        "1️⃣ أرسل أمر التسمية بهذا الشكل:\n"
-        "`/set قلبي يحترق لأجله | 10 | 720p - HD`\n\n"
-        "2️⃣ بعدها أرسل الفيديوهات (حتى دفعة كاملة)، وسأعيد إرسالها لك مرتبة ومسمّاة تلقائياً.\n\n"
-        "لإيقاف الوضع الحالي: `/stop`"
+        "🎬 **بوت ترقيم وحلقات المسلسلات**\n\n"
+        f"📌 **المسلسل الحالي:** {state['series']}\n"
+        f"🔢 **الحلقة القادمة:** ({format_ep(state['next_ep'])})\n"
+        f"🎞 **الجودة:** ({state['quality']})\n"
+        f"📝 **الكابشن القادم:**\n`{current_cap}`\n\n"
+        "**الأوامر المتاحة:**\n"
+        "• `/setseries اسم المسلسل` — لتغيير اسم المسلسل\n"
+        "• `/setep 9` — لتحديد رقم الحلقة القادمة\n"
+        "• `/setquality 720p` — لتغيير الجودة (مثلاً HD أو 720p)\n"
+        "• `/status` — لعرض الإعدادات الحالية\n\n"
+        "📥 فقط أرسل **الفيديو** الآن وسأعيد إرساله بالكابشن الجاهز وأزيد الرقم تلقائياً!"
     )
     bot.reply_to(message, text, parse_mode="Markdown")
 
 
-@bot.message_handler(commands=["set"])
-def set_naming(message):
-    raw = message.text.replace("/set", "", 1).strip()
-    parts = [p.strip() for p in raw.split("|")]
-
-    if len(parts) < 2 or not parts[0]:
-        bot.reply_to(
-            message,
-            "اكتب الأمر هكذا:\n`/set قلبي يحترق لأجله | 10 | 720p - HD`",
-            parse_mode="Markdown",
-        )
+@bot.message_handler(commands=["setseries"])
+def set_series(message):
+    if not is_admin(message):
         return
 
-    series_name = parts[0]
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        bot.reply_to(message, "⚠️ اكتب الاسم بعد الأمر، مثال:\n`/setseries أمنية حب`", parse_mode="Markdown")
+        return
+
+    state["series"] = parts[1].strip()
+    save_state(state)
+    bot.reply_to(message, f"✅ تم تحديث اسم المسلسل إلى: **{state['series']}**", parse_mode="Markdown")
+
+
+@bot.message_handler(commands=["setep"])
+def set_episode(message):
+    if not is_admin(message):
+        return
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip().isdigit():
+        bot.reply_to(message, "⚠️ اكتب رقم الحلقة بشكل صحيح، مثال:\n`/setep 8`", parse_mode="Markdown")
+        return
+
+    ep_val = int(parts[1].strip())
+    if ep_val < 1:
+        bot.reply_to(message, "⚠️ رقم الحلقة يجب أن يكون 1 أو أكثر.")
+        return
+
+    state["next_ep"] = ep_val
+    save_state(state)
+    bot.reply_to(message, f"✅ تم ضبط الحلقة القادمة لتكون: **({format_ep(ep_val)})**", parse_mode="Markdown")
+
+
+@bot.message_handler(commands=["setquality"])
+def set_quality(message):
+    if not is_admin(message):
+        return
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        bot.reply_to(message, "⚠️ اكتب الجودة بعد الأمر، مثال:\n`/setquality HD` أو `/setquality 720p`", parse_mode="Markdown")
+        return
+
+    state["quality"] = parts[1].strip()
+    save_state(state)
+    bot.reply_to(message, f"✅ تم تحديث الجودة إلى: **({state['quality']})**", parse_mode="Markdown")
+
+
+@bot.message_handler(content_types=["video", "document"])
+def handle_media(message):
+    if not is_admin(message):
+        return
+
+    file_id = None
+    is_video = False
+
+    if message.content_type == "video":
+        file_id = message.video.file_id
+        is_video = True
+    elif message.content_type == "document":
+        mime = message.document.mime_type or ""
+        if mime.startswith("video/"):
+            file_id = message.document.file_id
+            is_video = False
+        else:
+            bot.reply_to(message, "⚠️ يرجى إرسال ملف فيديو فقط.")
+            return
+
+    ep_num = state["next_ep"]
+    caption = build_caption(state["series"], ep_num, state["quality"])
+
     try:
-        start_num = int(parts[1])
-    except ValueError:
-        bot.reply_to(
-            message,
-            "الرقم بعد `|` يجب أن يكون عدداً صحيحاً، مثل `1` أو `10`.",
-            parse_mode="Markdown",
+        if is_video:
+            bot.send_video(
+                chat_id=message.chat.id,
+                video=file_id,
+                caption=caption,
+                supports_streaming=True,
+            )
+        else:
+            bot.send_document(
+                chat_id=message.chat.id,
+                document=file_id,
+                caption=caption,
+            )
+
+        # زيادة رقم الحلقة تلقائياً بعد نجاح الإرسال
+        state["next_ep"] = ep_num + 1
+        save_state(state)
+
+        bot.send_message(
+            chat_id=message.chat.id,
+            text=f"✔️ تم تجهيز الحلقة ({format_ep(ep_num)}) — التالية ستكون ({format_ep(state['next_ep'])})",
         )
-        return
 
-    quality = parts[2] if len(parts) >= 3 and parts[2] else "720p - HD"
-
-    user_sessions[message.chat.id] = {
-        "series": series_name,
-        "next_num": start_num,
-        "quality": quality,
-    }
-
-    sample = build_caption(user_sessions[message.chat.id], start_num)
-    bot.reply_to(
-        message,
-        f"✅ تم الضبط:\n"
-        f"• المسلسل: *{series_name}*\n"
-        f"• يبدأ من الحلقة: *{start_num:02d}*\n"
-        f"• الدقة: *{quality}*\n\n"
-        f"المعاينة:\n`{sample}`\n\n"
-        f"الآن أرسل الفيديوهات.",
-        parse_mode="Markdown",
-    )
+    except Exception as e:
+        bot.reply_to(message, f"❌ حدث خطأ أثناء الإرسال:\n`{e}`", parse_mode="Markdown")
 
 
-@bot.message_handler(commands=["stop"])
-def stop_naming(message):
-    user_sessions.pop(message.chat.id, None)
-    bot.reply_to(message, "تم إيقاف وضع التسمية التلقائية.")
-
-
-@bot.message_handler(content_types=["video"])
-def handle_video(message):
-    chat_id = message.chat.id
-    if chat_id not in user_sessions:
-        bot.reply_to(
-            message,
-            "حدد أولاً اسم العمل ورقم البداية والدقة عبر:\n`/set قلبي يحترق لأجله | 10 | 720p - HD`",
-            parse_mode="Markdown",
-        )
-        return
-
-    session = user_sessions[chat_id]
-    num = session["next_num"]
-    caption = build_caption(session, num)
-    session["next_num"] += 1
-
-    file_id = message.video.file_id
-    bot.send_video(
-        chat_id=chat_id,
-        video=file_id,
-        caption=caption,
-        supports_streaming=True,
-    )
-
-
-if __name__ == "__main__":
-    threading.Thread(target=run_web, daemon=True).start()
-    bot.infinity_polling(skip_pending=True)
+print("Bot is running...")
+bot.infinity_polling(skip_pending=True)
